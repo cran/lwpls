@@ -1,0 +1,601 @@
+---
+title: "Choosing a similarity index"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Choosing a similarity index}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+#| include: false
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 3.2,
+  fig.retina = 2,
+  fig.align = "center",
+  out.width = "100%"
+)
+```
+
+LW-PLS fits a separate model around every query sample, and that model is
+only as good as the training samples it is built on. The `similarity`
+argument decides which samples these are: it sets how the distance between a
+training sample and the query is measured before the distance is turned into
+a weight. This article explains the two indexes available in lwpls, shows
+with simulated data when each one works and when it fails, and ends with
+practical advice for choosing between them.
+
+```{r}
+#| label: setup
+#| message: false
+library(lwpls)
+library(ggplot2)
+```
+
+```{r}
+#| label: plot-helpers
+#| include: false
+theme_article <- function(base_size = 10) {
+  theme_bw(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey92", linewidth = 0.25),
+      panel.border = element_rect(colour = "grey35", linewidth = 0.4),
+      strip.background = element_rect(fill = "grey95", colour = "grey35",
+                                       linewidth = 0.4),
+      axis.ticks = element_line(colour = "grey35", linewidth = 0.3),
+      axis.text = element_text(colour = "grey20"),
+      legend.background = element_blank(),
+      legend.key = element_blank()
+    )
+}
+
+index_colors <- c("Euclidean" = "#2a78d6", "Covariance-based" = "#eb6834")
+weight_colors <- c("white", "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab",
+                   "#0d366b")
+
+index_label <- function(similarity) {
+  factor(ifelse(similarity == "euclidean", "Euclidean", "Covariance-based"),
+         levels = names(index_colors))
+}
+
+# Test RMSE versus localization, with the best value of each index and the
+# global PLS model for reference.
+plot_rmse <- function(curves, global) {
+  curves$index <- index_label(curves$similarity)
+  best <- do.call(rbind, lapply(split(curves, curves$index), function(d) {
+    d[which.min(d$rmse), ]
+  }))
+  best$label <- sprintf("%.3f", best$rmse)
+  ggplot(curves, aes(localization, rmse, colour = index)) +
+    geom_hline(yintercept = global, linetype = "dashed", colour = "grey35",
+               linewidth = 0.4) +
+    annotate("text", x = 1, y = global, vjust = -0.5, size = 3,
+             colour = "grey25", label = sprintf("global PLS (%.3f)", global)) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.1) +
+    geom_point(data = best, size = 3, shape = 21, fill = "white",
+               stroke = 0.9) +
+    geom_text(data = best, aes(label = label), vjust = 2, size = 3,
+              show.legend = FALSE) +
+    scale_x_log10() +
+    scale_y_continuous(expand = expansion(mult = c(0.14, 0.08))) +
+    scale_colour_manual(values = index_colors, name = NULL) +
+    labs(x = expression("Localization " * varphi), y = "Test RMSE") +
+    theme_article() +
+    theme(legend.position = "inside", legend.position.inside = c(0.985, 0.03),
+          legend.justification = c(1, 0),
+          legend.background = element_rect(fill = "white", colour = NA))
+}
+```
+
+## One weight function, two distances
+
+For a query sample $x_q$, the training sample $x_i$ receives the weight
+
+$$
+\omega_i = \exp\left(-\frac{d_i}{\sigma_d \, \varphi}\right),
+$$
+
+where $d_i$ is its distance to the query, $\sigma_d$ is the standard deviation
+of the distances of all training samples and $\varphi$ is the `localization`
+parameter. Dividing by $\sigma_d$ makes $\varphi$ unitless: a training sample
+that is $\varphi$ standard deviations farther from the query than the nearest
+one gets $e^{-1} \approx 0.37$ times the weight of the nearest one, whatever
+the index (Figure 1). The weights only matter
+up to a constant factor, since multiplying all of them by the same number
+leaves the weighted PLS model unchanged.
+
+```{r}
+#| label: fig-kernel
+#| echo: false
+#| fig-width: 5.5
+#| fig-height: 3
+#| fig-cap: "Figure 1. Similarity weight as a function of the distance, for four localization values. Each curve crosses \\(e^{-1}\\) (dotted line) at \\(d_i / \\sigma_d = \\varphi\\) (points)."
+#| fig-alt: "Four decreasing exponential curves of the weight against the distance divided by its standard deviation. Smaller localization values decrease faster."
+kernel <- expand.grid(u = seq(0, 4, length.out = 400), phi = c(0.25, 0.5, 1, 2))
+kernel$weight <- exp(-kernel$u / kernel$phi)
+crossings <- data.frame(u = c(0.25, 0.5, 1, 2), phi = c(0.25, 0.5, 1, 2),
+                        weight = exp(-1))
+
+ggplot(kernel, aes(u, weight, colour = factor(phi))) +
+  geom_hline(yintercept = exp(-1), linetype = "dotted", colour = "grey45",
+             linewidth = 0.35) +
+  geom_line(linewidth = 0.7) +
+  geom_point(data = crossings, size = 1.8) +
+  scale_colour_manual(values = weight_colors[3:6], name = expression(varphi)) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.02))) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0.01, 0.03))) +
+  labs(x = expression(d[i] / sigma[d]), y = expression(omega[i])) +
+  theme_article() +
+  theme(legend.position = "inside", legend.position.inside = c(0.88, 0.68))
+```
+
+The two indexes therefore differ only in $d_i$. Both, and the Mahalanobis
+distance that we use below for comparison, are quadratic forms of the
+difference $\Delta_i = x_i - x_q$ between the standardized predictors:
+
+$$
+d_i^2 = \Delta_i^\top M \, \Delta_i,
+$$
+
+| Distance | $M$ | Shape of the neighborhood | In lwpls |
+|---|---|---|---|
+| Euclidean | $I$ | sphere | `similarity = "euclidean"` |
+| Mahalanobis | $S^{-1}$ | ellipsoid along the correlations of $X$ | no |
+| Covariance-based | $\Gamma \Gamma^\top$ | slab perpendicular to $\Gamma$ | `similarity = "covariance"` |
+
+### Euclidean distance
+
+Write the covariance matrix of the standardized predictors as $S = \sum_k
+\lambda_k v_k v_k^\top$, with principal components $v_k$ and variances
+$\lambda_k$. The Euclidean distance is
+
+$$
+d_i^2 = \lVert \Delta_i \rVert^2 = \sum_k \left(v_k^\top \Delta_i\right)^2 .
+$$
+
+Every direction enters the sum with the same coefficient, but for two random
+samples the term of component $k$ is $2 \lambda_k$ on average. **The distance
+is therefore dominated by the largest sources of variation in $X$**, whether
+they are related to the outcome or not. In spectra, these are often baseline
+shifts, scattering or interfering compounds. The Euclidean distance does not
+use the outcome at all.
+
+The Mahalanobis distance, $M = S^{-1}$, divides each term by $\lambda_k$ so
+that every component counts equally. It is often what "covariance-based
+distance" means, but it uses the covariance *among the predictors*. It is not
+available in lwpls: with more wavelengths than samples $S$ cannot be inverted,
+and it inflates the components of smallest variance, which are mostly noise.
+
+### Covariance-based distance
+
+Covariance-based LW-PLS (CbLW-PLS; Hazama and Kano, 2015) uses the covariance
+*between the predictors and the outcome*. With centered $X$ and $y$, the unit
+vector $w$ that maximizes $\operatorname{cov}(Xw, y) \propto w^\top X^\top y$
+is, by the Cauchy--Schwarz inequality $w^\top X^\top y \le \lVert w \rVert \,
+\lVert X^\top y \rVert$,
+
+$$
+\Gamma = \frac{X^\top y}{\lVert X^\top y \rVert}.
+$$
+
+$\Gamma$ is the first weight vector of a PLS model and $t = X\Gamma$ is its
+first score. The distance is measured along this direction only:
+
+$$
+d_i = \left| \Gamma^\top (x_i - x_q) \right| = |t_i - t_q| .
+$$
+
+A one-component PLS model predicts $\hat y = \bar y + b \, t$, so $|\hat y_i -
+\hat y_q| = |b| \, d_i$. The factor $|b|$ cancels in $d_i / \sigma_d$: **the
+covariance-based weights are those obtained from the distance between the
+predictions of a one-component global PLS model.** The neighbors of the query
+are the training samples that this simple model predicts to have a similar
+outcome.
+
+Since $M = \Gamma\Gamma^\top$ has rank one, all the directions perpendicular
+to $\Gamma$ are ignored: samples far from the query in $X$ are full neighbors
+if they have the same score $t$. With several outcomes (or classes, coded as
+indicators), $\Gamma = X^\top Y / \lVert X^\top Y \rVert_F$ has one column per
+outcome and $d_i = \lVert \Gamma^\top (x_i - x_q) \rVert$. Robust models
+(`robust = TRUE`) compute $\Gamma$ with the initial weights of partial robust
+M-regression, so that outliers do not distort it.
+
+### The three neighborhoods side by side
+
+Two correlated predictors and a nonlinear outcome are enough to see the
+shapes:
+
+```{r}
+#| label: geometry-data
+set.seed(2026)
+n <- 250
+x1 <- rnorm(n)
+x2 <- 0.75 * x1 + sqrt(1 - 0.75^2) * rnorm(n)
+y <- sin(1.5 * x1) + 0.3 * x2 + rnorm(n, sd = 0.1)
+x <- scale(cbind(x1, x2))
+
+gamma <- crossprod(x, y - mean(y))
+gamma <- drop(gamma / sqrt(sum(gamma^2)))
+gamma
+
+query <- c(0.6, 0.2)
+distance <- list(
+  "Euclidean" = function(z) sqrt(rowSums(sweep(z, 2, query)^2)),
+  "Mahalanobis" = function(z) sqrt(mahalanobis(z, query, cov(x))),
+  "Covariance-based" = function(z) abs(drop(sweep(z, 2, query) %*% gamma))
+)
+```
+
+```{r}
+#| label: fig-geometry
+#| echo: false
+#| fig-width: 7.2
+#| fig-height: 3.75
+#| fig-cap: "Figure 2. Weights of the three distances around the same query (white point) with \\(\\varphi = 0.5\\), relative to the largest one, with contour lines at 0.1 and 0.5. The arrow is \\(\\Gamma\\), and \\(n_\\text{eff} = (\\sum \\omega_i)^2 / \\sum \\omega_i^2\\) is the effective number of neighbors."
+#| fig-alt: "Three maps of the weights over the two predictors. Euclidean weights form circles around the query, Mahalanobis weights form ellipses along the correlation of the predictors, and covariance-based weights form a band perpendicular to the arrow Gamma."
+phi <- 0.5
+grid_values <- seq(-3, 3, length.out = 241)
+grid <- as.matrix(expand.grid(x1 = grid_values, x2 = grid_values))
+panels <- names(distance)
+
+fields <- do.call(rbind, lapply(panels, function(nm) {
+  d_train <- distance[[nm]](x)
+  d_grid <- distance[[nm]](grid)
+  data.frame(grid, index = nm,
+             weight = pmin(1, exp(-(d_grid - min(d_train)) / (sd(d_train) * phi))))
+}))
+# Facet labels with the effective number of neighbors of each distance.
+facet_labels <- vapply(panels, function(nm) {
+  d_train <- distance[[nm]](x)
+  w <- exp(-(d_train - min(d_train)) / (sd(d_train) * phi))
+  sprintf('"%s" ~~ (italic(n)[eff] == %.0f)', nm, sum(w)^2 / sum(w^2))
+}, character(1))
+fields$index <- factor(facet_labels[fields$index], levels = facet_labels)
+arrow_df <- data.frame(index = factor(facet_labels[["Covariance-based"]],
+                                      levels = facet_labels),
+                       x = query[1], y = query[2],
+                       xend = query[1] + 1.5 * gamma[1],
+                       yend = query[2] + 1.5 * gamma[2])
+training <- data.frame(x1 = x[, 1], x2 = x[, 2])
+
+ggplot(fields, aes(x1, x2)) +
+  geom_raster(aes(fill = weight), interpolate = TRUE) +
+  geom_contour(aes(z = weight), breaks = c(0.1, 0.5), colour = "white",
+               linewidth = 0.3) +
+  geom_point(data = training, shape = 21, size = 0.9, fill = "grey15",
+             colour = "white", stroke = 0.15) +
+  geom_segment(data = arrow_df, aes(x = x, y = y, xend = xend, yend = yend),
+               linewidth = 0.6, colour = "black",
+               arrow = grid::arrow(length = grid::unit(1.8, "mm"), type = "closed")) +
+  geom_text(data = arrow_df, aes(x = xend, y = yend), label = "Gamma",
+            parse = TRUE, hjust = -0.3, vjust = -0.1, size = 3.6) +
+  annotate("point", x = query[1], y = query[2], shape = 21, size = 2.6,
+           fill = "white", colour = "black", stroke = 0.7) +
+  facet_wrap(~index, nrow = 1, labeller = label_parsed) +
+  scale_fill_gradientn(colours = weight_colors, limits = c(0, 1),
+                       name = expression(omega[i] / max(omega))) +
+  scale_x_continuous(breaks = c(-2, 0, 2)) +
+  scale_y_continuous(breaks = c(-2, 0, 2)) +
+  coord_equal(xlim = c(-3, 3), ylim = c(-3, 3), expand = FALSE) +
+  guides(fill = guide_colourbar(title.position = "top", title.hjust = 0.5)) +
+  labs(x = expression(x[1] ~ "(standardized)"), y = expression(x[2] ~ "(standardized)")) +
+  theme_article() +
+  theme(legend.position = "bottom", legend.key.width = grid::unit(1.6, "cm"),
+        legend.key.height = grid::unit(0.25, "cm"), panel.grid = element_blank(),
+        panel.spacing = grid::unit(0.8, "lines"),
+        legend.margin = margin(0, 0, 0, 0))
+```
+
+The Euclidean neighborhood is a circle. The Mahalanobis neighborhood
+stretches along the main axis of the cloud, the direction of largest variance
+of $X$. The covariance-based neighborhood is a band across that same axis: here
+$\Gamma$ points along it, because that is where the predictors covary with
+$y$, and differences along $\Gamma$ are exactly what the covariance-based
+distance measures.
+
+## When the covariance-based index helps
+
+The simulated spectra below contain three sources of variation: an analyte
+band whose absorbance saturates with the concentration (the outcome), so that
+the relationship is nonlinear; a large interfering band; and baseline offsets
+and slopes. Only the analyte is related to the outcome, while most of the
+variance of $X$ comes from the interferent and the baseline.
+
+```{r}
+#| label: spectra-data
+wavelength <- seq(1100, 1700, by = 5)
+band <- function(center, width) exp(-0.5 * ((wavelength - center) / width)^2)
+
+simulate_spectra <- function(n) {
+  concentration <- runif(n, 0.05, 1)
+  absorbance <- 1 - exp(-2.5 * concentration)
+  interferent <- runif(n, 0, 1.5)
+  offset <- rnorm(n, sd = 0.15)
+  slope <- rnorm(n, sd = 0.1)
+  x <- outer(0.8 * absorbance, band(1460, 22)) +
+    outer(interferent, band(1330, 70)) +
+    outer(offset, rep(1, length(wavelength))) +
+    outer(slope, (wavelength - 1400) / 300) +
+    matrix(rnorm(n * length(wavelength), sd = 0.004), n)
+  colnames(x) <- paste0("nm", wavelength)
+  list(x = x, y = concentration)
+}
+
+set.seed(7)
+train <- simulate_spectra(300)
+test <- simulate_spectra(300)
+```
+
+We compute $\Gamma$ on the standardized training spectra, as lwpls does, and
+measure how well the score $t = X\Gamma$ tracks the outcome:
+
+```{r}
+#| label: spectra-gamma
+x_train <- scale(train$x)
+gamma_spectra <- crossprod(x_train, train$y - mean(train$y))
+gamma_spectra <- drop(gamma_spectra / sqrt(sum(gamma_spectra^2)))
+cor(drop(x_train %*% gamma_spectra), train$y)
+```
+
+```{r}
+#| label: fig-spectra
+#| echo: false
+#| fig-height: 4.6
+#| fig-cap: "Figure 3. Top: 40 training spectra, colored by their concentration. Bottom: the covariance direction \\(\\Gamma\\), with the analyte band in gray. \\(\\Gamma\\) peaks on the analyte band; its small, flat loading elsewhere comes from a chance correlation of the outcome with the interferent and the baseline."
+#| fig-alt: "Top panel: simulated spectra with a broad interfering band near 1330 nm and a narrower analyte band near 1460 nm. Bottom panel: Gamma, which peaks at the analyte band and is close to zero elsewhere."
+shown <- 1:40
+spectra_df <- data.frame(
+  wavelength = rep(wavelength, each = length(shown)),
+  value = as.vector(train$x[shown, ]),
+  y = rep(train$y[shown], times = length(wavelength)),
+  id = rep(shown, times = length(wavelength)),
+  panel = "Absorbance"
+)
+gamma_df <- data.frame(wavelength = wavelength, value = gamma_spectra,
+                       panel = "Gamma[j]")
+band_df <- data.frame(wavelength = wavelength,
+                      value = band(1460, 22) * max(gamma_spectra),
+                      panel = "Gamma[j]")
+labels_df <- data.frame(wavelength = c(1330, 1460),
+                        value = max(spectra_df$value) * 1.07,
+                        label = c("interferent", "analyte"),
+                        panel = "Absorbance")
+as_panel <- function(df) {
+  df$panel <- factor(df$panel, levels = c("Absorbance", "Gamma[j]"))
+  df
+}
+spectra_df <- as_panel(spectra_df)
+gamma_df <- as_panel(gamma_df)
+band_df <- as_panel(band_df)
+labels_df <- as_panel(labels_df)
+
+ggplot(mapping = aes(wavelength, value)) +
+  geom_area(data = band_df, fill = "grey88") +
+  geom_hline(data = gamma_df[1, ], aes(yintercept = 0), colour = "grey35",
+             linewidth = 0.3) +
+  geom_line(data = spectra_df, aes(group = id, colour = y), linewidth = 0.35) +
+  geom_line(data = gamma_df, colour = index_colors[["Covariance-based"]],
+            linewidth = 0.7) +
+  geom_text(data = labels_df, aes(label = label), size = 3, colour = "grey25") +
+  facet_grid(panel ~ ., scales = "free_y", switch = "y",
+             labeller = label_parsed) +
+  scale_colour_gradientn(colours = weight_colors[-1], name = "Concentration") +
+  labs(x = "Wavelength (nm)", y = NULL) +
+  theme_article() +
+  theme(strip.placement = "outside", strip.background.y = element_blank(),
+        strip.text.y.left = element_text(angle = 90, size = rel(1.1)),
+        legend.title = element_text(size = rel(0.9)),
+        legend.key.height = grid::unit(0.9, "cm"),
+        legend.key.width = grid::unit(0.25, "cm"))
+```
+
+We then fit LW-PLS with both indexes over a range of localization values and
+compute the test RMSE. A very large localization gives nearly equal weights,
+that is, a global PLS model, which we use as a reference:
+
+```{r}
+#| label: spectra-rmse
+rmse_by_localization <- function(train, test, num_comp, localization) {
+  grid <- expand.grid(localization = localization,
+                      similarity = c("euclidean", "covariance"),
+                      stringsAsFactors = FALSE)
+  grid$rmse <- mapply(function(phi, index) {
+    fit <- lwpls_fit(train$x, train$y, num_comp = num_comp,
+                     localization = phi, similarity = index)
+    sqrt(mean((test$y - predict(fit, test$x)$.pred)^2))
+  }, grid$localization, grid$similarity)
+  grid
+}
+
+global_rmse <- function(train, test, num_comp) {
+  fit <- lwpls_fit(train$x, train$y, num_comp = num_comp, localization = 1e6)
+  sqrt(mean((test$y - predict(fit, test$x)$.pred)^2))
+}
+
+localization_grid <- 10^seq(-1.5, 1, length.out = 14)
+spectra_rmse <- rmse_by_localization(train, test, num_comp = 4, localization_grid)
+spectra_global <- global_rmse(train, test, num_comp = 4)
+
+# Best localization of each index
+do.call(rbind, lapply(split(spectra_rmse, spectra_rmse$similarity),
+                      function(d) d[which.min(d$rmse), ]))
+spectra_global
+```
+
+```{r}
+#| label: fig-spectra-rmse
+#| echo: false
+#| fig-width: 6
+#| fig-height: 3.4
+#| fig-cap: "Figure 4. Test RMSE of LW-PLS with 4 components on the simulated spectra. Open circles mark the best localization of each index, with its RMSE; the dashed line is the global PLS model."
+#| fig-alt: "Test RMSE against localization on a log scale. The covariance-based curve stays below the Euclidean curve everywhere, with a minimum about half as large. Both approach the global PLS error for large localization."
+plot_rmse(spectra_rmse, spectra_global)
+```
+
+The covariance-based index halves the error of the Euclidean index. The
+weights of a single query show why. `lwpls_local()` reports the effective
+number of neighbors of each prediction, and the weights themselves follow from
+the formulas above:
+
+```{r}
+#| label: spectra-query
+query_id <- which.min(abs(test$y - 0.5))
+query_x <- test$x[query_id, , drop = FALSE]
+z_query <- (drop(query_x) - attr(x_train, "scaled:center")) /
+  attr(x_train, "scaled:scale")
+
+d_euclidean <- sqrt(rowSums(sweep(x_train, 2, z_query)^2))
+d_covariance <- abs(drop(sweep(x_train, 2, z_query) %*% gamma_spectra))
+relative_weights <- function(d, phi) exp(-(d - min(d)) / (sd(d) * phi))
+
+query_fits <- lapply(c(euclidean = "euclidean", covariance = "covariance"),
+                     function(index) {
+  lwpls_fit(train$x, train$y, num_comp = 4, localization = 0.2,
+            similarity = index)
+})
+sapply(query_fits, function(fit) lwpls_local(fit, query_x)$reliability$n_eff)
+```
+
+```{r}
+#| label: fig-spectra-weights
+#| echo: false
+#| fig-height: 2.9
+#| fig-cap: "Figure 5. Weights of the training samples for one test spectrum with a concentration of 0.5 (dashed line), against their own concentration (\\(\\varphi = 0.2\\), weights relative to the largest one)."
+#| fig-alt: "Two scatter plots of the weights against the concentration of the training samples. Euclidean weights are high for a few samples spread over all concentrations. Covariance-based weights are zero below a concentration of 0.3 and spread over the samples above."
+weights_df <- rbind(
+  data.frame(similarity = "euclidean", y = train$y,
+             weight = relative_weights(d_euclidean, 0.2)),
+  data.frame(similarity = "covariance", y = train$y,
+             weight = relative_weights(d_covariance, 0.2))
+)
+weights_df$index <- index_label(weights_df$similarity)
+
+ggplot(weights_df, aes(y, weight, colour = index)) +
+  geom_vline(xintercept = test$y[query_id], linetype = "dashed",
+             colour = "grey35", linewidth = 0.4) +
+  geom_point(size = 0.9, alpha = 0.75) +
+  facet_wrap(~index, nrow = 1) +
+  scale_colour_manual(values = index_colors, guide = "none") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+  labs(x = "Concentration of the training sample",
+       y = expression(omega[i] / max(omega))) +
+  theme_article()
+```
+
+The Euclidean neighbors are close to the query in interferent and baseline,
+not in concentration, so they are spread over the whole concentration range.
+The covariance-based index gives almost no weight to the samples below 0.3. Its neighborhood is
+still broad and asymmetric, for two reasons: saturation compresses the
+differences between high concentrations along $\Gamma$, and $\Gamma$ keeps a
+small loading on the interferent and the baseline (Figure 3).
+
+## When the covariance-based index fails
+
+$\Gamma$ only captures the *linear* covariance between the predictors and the
+outcome. When the outcome is a symmetric function of a predictor, that
+covariance vanishes: with $x_1$ standard normal and $y = x_1^2$,
+$\operatorname{cov}(x_1, y) = E[x_1^3] = 0$. $\Gamma$ is then set by chance
+correlations in the training set.
+
+```{r}
+#| label: symmetric-data
+simulate_symmetric <- function(n) {
+  x <- matrix(rnorm(n * 5), n, dimnames = list(NULL, paste0("x", 1:5)))
+  list(x = x, y = x[, 1]^2 + rnorm(n, sd = 0.2))
+}
+
+set.seed(11)
+train_sym <- simulate_symmetric(300)
+test_sym <- simulate_symmetric(300)
+
+x_sym <- scale(train_sym$x)
+gamma_sym <- crossprod(x_sym, train_sym$y - mean(train_sym$y))
+gamma_sym <- drop(gamma_sym / sqrt(sum(gamma_sym^2)))
+round(gamma_sym, 2)
+cor(drop(x_sym %*% gamma_sym), train_sym$y)
+```
+
+```{r}
+#| label: fig-symmetric
+#| echo: false
+#| fig-height: 2.9
+#| fig-cap: "Figure 6. The outcome against \\(x_1\\), the predictor it depends on (left), and against the score \\(t = X\\Gamma\\) that the covariance-based distance uses (right)."
+#| fig-alt: "Left: a clear parabola of the outcome against x1. Right: the outcome against the score t shows no clear pattern."
+symmetric_df <- rbind(
+  data.frame(panel = "x[1]", coordinate = x_sym[, 1], y = train_sym$y),
+  data.frame(panel = "t == X * Gamma", coordinate = drop(x_sym %*% gamma_sym),
+             y = train_sym$y)
+)
+symmetric_df$panel <- factor(symmetric_df$panel,
+                             levels = c("x[1]", "t == X * Gamma"))
+
+ggplot(symmetric_df, aes(coordinate, y)) +
+  geom_point(size = 0.8, alpha = 0.6, colour = "grey20") +
+  facet_wrap(~panel, nrow = 1, labeller = label_parsed) +
+  labs(x = "Standardized coordinate", y = "y") +
+  theme_article()
+```
+
+```{r}
+#| label: symmetric-rmse
+symmetric_rmse <- rmse_by_localization(train_sym, test_sym, num_comp = 2,
+                                       localization_grid)
+symmetric_global <- global_rmse(train_sym, test_sym, num_comp = 2)
+do.call(rbind, lapply(split(symmetric_rmse, symmetric_rmse$similarity),
+                      function(d) d[which.min(d$rmse), ]))
+symmetric_global
+```
+
+```{r}
+#| label: fig-symmetric-rmse
+#| echo: false
+#| fig-width: 6
+#| fig-height: 3.4
+#| fig-cap: "Figure 7. Test RMSE of LW-PLS with 2 components for \\(y = x_1^2\\). Open circles mark the best localization of each index, with its RMSE; the dashed line is the global PLS model."
+#| fig-alt: "Test RMSE against localization on a log scale. The Euclidean curve reaches a much lower minimum than the covariance-based curve, which stays close to the global PLS error."
+plot_rmse(symmetric_rmse, symmetric_global)
+```
+
+The Euclidean neighborhoods still follow $x_1$, while the covariance-based
+ones mostly follow noise: the covariance-based error is more than twice the
+Euclidean one, and only a little below that of the global model. The same happens
+whenever the local behavior depends on a direction that the global
+covariance $X^\top y$ does not capture, for example regimes defined by other
+constituents of the samples (such as matrix effects in emission
+spectroscopy).
+
+## Choosing in practice
+
+* **Look at $\Gamma$ first.** Computing it takes one line (see above). If it
+  resembles the spectral signature of the property to predict and the score
+  $t = X\Gamma$ is well correlated with the outcome, the covariance-based
+  index is likely to help. If $\Gamma$ looks like noise, or the correlation is
+  weak, prefer the Euclidean index.
+* **The covariance-based index suits** data in which most of the variance of
+  $X$ is unrelated to the outcome (interferents, baseline, scattering,
+  temperature) and the outcome changes monotonically with the relevant
+  signal, as in many NIR, Raman or LIBS calibrations.
+* **The Euclidean index suits** nonmonotonic relationships, local behavior
+  driven by directions other than $X^\top y$, and data whose irrelevant
+  variation has already been removed by preprocessing (SNV, derivatives),
+  since the Euclidean distance then reflects the relevant variation. It also
+  does not depend on the outcome, so it cannot be misled by chance
+  correlations.
+* **Tune both.** The best localization differs between the indexes (Figures
+  4 and 7), so `similarity` should be tuned together with `localization` and
+  `num_comp`, as shown in `vignette("lwpls")`.
+
+## References
+
+* Kim, S., Kano, M., Nakagawa, H. and Hasebe, S. (2011). Estimation of active
+  pharmaceutical ingredients content using locally weighted partial least
+  squares and statistical wavelength selection. *International Journal of
+  Pharmaceutics*, 421(2), 269--274.
+* Hazama, K. and Kano, M. (2015). Covariance-based locally weighted partial
+  least squares for high-performance adaptive modeling. *Chemometrics and
+  Intelligent Laboratory Systems*, 146, 55--62.
